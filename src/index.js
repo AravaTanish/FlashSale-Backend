@@ -1,15 +1,14 @@
 import "dotenv/config";
-import express from "express";
-import cookieParser from "cookie-parser";
 import connectDB from "./db/connectDB.js";
+import app from "./app.js";
 
-const app = express();
-
-app.use(express.json());
-app.use(cookieParser());
-
-connectDB();
-
-app.listen(process.env.PORT, () => {
-  console.log(`Server is running on port ${process.env.PORT}`);
-});
+await connectDB()
+  .then(() => {
+    app.listen(process.env.PORT, () => {
+      console.log(`Server is running on port ${process.env.PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to connect to the database:", error);
+    process.exit(1);
+  });
