@@ -7,3 +7,5 @@ const globalErrorHandler = (err, req, res, next) => {
     errors: err.errors || [],
   });
 };
+
+export default globalErrorHandler;
