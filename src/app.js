@@ -8,7 +8,8 @@ const app = express();
 
 app.use(express.json());
 app.use(cookieParser());
-app.use(globalErrorMiddleware);
+
 app.use("/backend/user", userRoutes);
+app.use(globalErrorMiddleware);
 
 export default app;
