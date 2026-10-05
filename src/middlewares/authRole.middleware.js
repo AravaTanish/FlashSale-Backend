@@ -1,7 +1,8 @@
+import ApiError from "../utils/apiError.js";
 const authorizeRole = (role) => {
   return (req, res, next) => {
     if (req.user.role !== role) {
-      throw new AppError("Forbidden", 403);
+      throw new ApiError(403, "Forbidden");
     }
     next();
   };
