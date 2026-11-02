@@ -2,9 +2,37 @@ import ApiResponse from "../utils/apiResponse.js";
 import ApiError from "../utils/apiError.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import Product from "../models/Product.model.js";
+import { getCache, setCache, deleteCache } from "../utils/cache.js";
+import {
+  ALL_PRODUCTS_CACHE_KEY,
+  ALL_PRODUCTS_TTL,
+  SINGLE_PRODUCT_TTL,
+} from "../constants/redisKeys.js";
 
 export const getAllProducts = asyncHandler(async (req, res) => {
-  const products = await Product.find();
+  let cachedProducts = null;
+
+  try {
+    cachedProducts = await getCache(ALL_PRODUCTS_CACHE_KEY);
+  } catch (error) {
+    console.error("Redis cache read failed:", error.message);
+  }
+
+  if (cachedProducts !== null) {
+    return res
+      .status(200)
+      .json(
+        new ApiResponse(200, "Products retrieved successfully", cachedProducts)
+      );
+  }
+
+  const products = await Product.find().select("-stock");
+
+  try {
+    await setCache(ALL_PRODUCTS_CACHE_KEY, products, ALL_PRODUCTS_TTL);
+  } catch (error) {
+    console.error("Redis cache write failed:", error.message);
+  }
 
   return res
     .status(200)
@@ -12,10 +40,34 @@ export const getAllProducts = asyncHandler(async (req, res) => {
 });
 
 export const getProductById = asyncHandler(async (req, res) => {
-  const product = await Product.findById(req.params.id);
+  const { id } = req.params;
+  const cacheKey = `product:${id}`;
+  let cachedProduct = null;
+
+  try {
+    cachedProduct = await getCache(cacheKey);
+  } catch (error) {
+    console.error("Redis cache read failed:", error.message);
+  }
+
+  if (cachedProduct !== null) {
+    return res
+      .status(200)
+      .json(
+        new ApiResponse(200, "Product retrieved successfully", cachedProduct)
+      );
+  }
+
+  const product = await Product.findById(id).select("-stock");
 
   if (!product) {
     throw new ApiError(404, "Product not found");
+  }
+
+  try {
+    await setCache(cacheKey, product, SINGLE_PRODUCT_TTL);
+  } catch (error) {
+    console.error("Redis cache write failed:", error.message);
   }
 
   return res
@@ -53,10 +105,16 @@ export const createProduct = asyncHandler(async (req, res) => {
 
   const product = await Product.create({
     name: name.trim(),
-    description,
+    description: description.trim(),
     price,
     stock,
   });
+
+  try {
+    await deleteCache(ALL_PRODUCTS_CACHE_KEY);
+  } catch (error) {
+    console.error("Redis cache delete failed:", error.message);
+  }
 
   return res
     .status(201)
@@ -77,9 +135,16 @@ export const addStock = asyncHandler(async (req, res) => {
   }
 
   product.stock += stock;
-  console.log(`Updated stock for product ${product.name}: ${product.stock}`);
-
+  if (product.stock > 0) {
+    product.inStock = true;
+  }
   await product.save();
+
+  try {
+    await deleteCache(`product:${product._id.toString()}`);
+  } catch (error) {
+    console.error("Redis cache delete failed:", error.message);
+  }
 
   return res
     .status(200)
@@ -104,22 +169,31 @@ export const updateProduct = asyncHandler(async (req, res) => {
   }
 
   if (description !== undefined) {
-    if (typeof description !== "string") {
+    if (typeof description !== "string" || description.trim() === "") {
       throw new ApiError(400, "Invalid product description");
     }
 
-    product.description = description;
+    product.description = description.trim();
   }
 
   if (price !== undefined) {
     if (!Number.isInteger(price) || price <= 0) {
       throw new ApiError(400, "Invalid product price");
     }
-
     product.price = price;
   }
-
   await product.save();
+
+  try {
+    await deleteCache(`product:${product._id.toString()}`);
+  } catch (error) {
+    console.error("Redis cache delete failed:", error.message);
+  }
+  try {
+    await deleteCache(ALL_PRODUCTS_CACHE_KEY);
+  } catch (error) {
+    console.error("Redis cache delete failed:", error.message);
+  }
 
   return res
     .status(200)

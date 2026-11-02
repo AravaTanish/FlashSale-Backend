@@ -26,9 +26,11 @@ const productSchema = new mongoose.Schema(
       default: 0,
     },
 
-    isActive: {
+    inStock: {
       type: Boolean,
-      default: true,
+      default: function () {
+        return this.stock > 0;
+      },
     },
   },
   {

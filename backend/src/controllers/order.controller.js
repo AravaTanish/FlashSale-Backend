@@ -3,6 +3,8 @@ import ApiError from "../utils/apiError.js";
 import ApiResponse from "../utils/apiResponse.js";
 import Product from "../models/Product.model.js";
 import Order from "../models/Order.model.js";
+import { deleteCache } from "../utils/cache.js";
+import { ALL_PRODUCTS_CACHE_KEY } from "../constants/redisKeys.js";
 
 export const createOrder = asyncHandler(async (req, res) => {
   const { items } = req.body;
@@ -63,13 +65,37 @@ export const createOrder = asyncHandler(async (req, res) => {
     });
   }
 
+  const productsToDeleteCache = [];
+
   for (const item of items) {
     const product = products.find(
       (product) => product._id.toString() === item.product.toString()
     );
 
+    const previousStock = product.stock;
     product.stock -= item.quantity;
+
+    if (previousStock > 0 && product.stock === 0) {
+      product.inStock = false;
+      productsToDeleteCache.push(product._id.toString());
+    }
+
     await product.save();
+  }
+
+  if (productsToDeleteCache.length > 0) {
+    for(const productId of productsToDeleteCache) {
+      try {
+        await deleteCache(`product:${productId}`);
+      } catch (error) {
+        console.error("Redis cache delete failed:", error.message);
+      }
+    }
+    try {
+      await deleteCache(ALL_PRODUCTS_CACHE_KEY);
+    } catch (error) {
+      console.error("Redis cache delete failed:", error.message);
+    }
   }
 
   const order = await Order.create({
