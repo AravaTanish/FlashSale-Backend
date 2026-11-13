@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import asyncHandler from "../utils/asyncHandler.js";
 import ApiError from "../utils/apiError.js";
 import ApiResponse from "../utils/apiResponse.js";
@@ -20,71 +21,107 @@ export const createOrder = asyncHandler(async (req, res) => {
         "Each order item must contain product and quantity"
       );
     }
-
-    if (!Number.isInteger(item.quantity) || item.quantity < 1) {
-      throw new ApiError(400, "Quantity must be a positive integer");
+    if (!Number.isSafeInteger(item.quantity) || item.quantity < 1) {
+      throw new ApiError(400, "Quantity must be a positive safe integer");
     }
   }
 
-  const productIds = items.map((item) => item.product);
-
-  const products = await Product.find({
-    _id: { $in: productIds },
-  });
-
-  if (products.length !== items.length) {
-    throw new ApiError(404, "One or more products were not found");
-  }
-
-  let totalAmount = 0;
-  const orderItems = [];
-
+  const allProductsMap = new Map();
   for (const item of items) {
-    const product = products.find(
-      (product) => product._id.toString() === item.product.toString()
-    );
-
-    if (!product) {
-      throw new ApiError(404, `Product ${item.product} not found`);
+    const productId = item.product.toString();
+    const newQuantity = (allProductsMap.get(productId) || 0) + item.quantity;
+    if (!Number.isSafeInteger(newQuantity)) {
+      throw new ApiError(400, "Quantity is too large");
     }
+    allProductsMap.set(productId, newQuantity);
+  }
 
-    if (product.stock < item.quantity) {
-      throw new ApiError(
-        400,
-        `Insufficient stock for product "${product.name}". Available stock: ${product.stock}`
-      );
-    }
+  const productIds = Array.from(allProductsMap.keys());
+  const productsToDeleteCache = new Set();
+  let order;
 
-    const itemTotal = product.price * item.quantity;
-    totalAmount += itemTotal;
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const products = await Product.find({
+        _id: { $in: productIds },
+      }).session(session);
 
-    orderItems.push({
-      product: product._id,
-      quantity: item.quantity,
-      price: product.price,
+      if (products.length !== productIds.length) {
+        throw new ApiError(404, "One or more products were not found");
+      }
+
+      const productMap = new Map();
+      for (const product of products) {
+        productMap.set(product._id.toString(), product);
+      }
+
+      let totalAmount = 0;
+      const orderItems = [];
+
+      for (const [productId, quantity] of allProductsMap) {
+        const product = productMap.get(productId);
+
+        if (!product) {
+          throw new ApiError(404, `Product ${productId} not found`);
+        }
+
+        const itemTotal = product.price * quantity;
+        totalAmount += itemTotal;
+
+        orderItems.push({
+          product: product._id,
+          quantity: quantity,
+          price: product.price,
+        });
+      }
+
+      for (const [productId, quantity] of allProductsMap) {
+        const product = productMap.get(productId);
+        const updatedProduct = await Product.findOneAndUpdate(
+          {
+            _id: product._id,
+            stock: { $gte: quantity },
+          },
+          {
+            $inc: { stock: -quantity },
+          },
+          {
+            returnDocument: "after",
+            session,
+          }
+        );
+
+        if (!updatedProduct) {
+          throw new ApiError(
+            400,
+            `Insufficient stock for product "${product.name}"`
+          );
+        }
+
+        if (updatedProduct.stock === 0) {
+          await Product.updateOne(
+            { _id: product._id },
+            { $set: { inStock: false } },
+            { session }
+          );
+          productsToDeleteCache.add(product._id.toString());
+        }
+      }
+      order = new Order({
+        user: req.user.id,
+        items: orderItems,
+        totalAmount,
+        status: "pending",
+      });
+      order = await order.save({ session });
     });
+  } finally {
+    await session.endSession();
   }
 
-  const productsToDeleteCache = [];
-
-  for (const item of items) {
-    const product = products.find(
-      (product) => product._id.toString() === item.product.toString()
-    );
-
-    const previousStock = product.stock;
-    product.stock -= item.quantity;
-
-    if (previousStock > 0 && product.stock === 0) {
-      product.inStock = false;
-      productsToDeleteCache.push(product._id.toString());
-    }
-
-    await product.save();
-  }
-
-  if (productsToDeleteCache.length > 0) {
-    for(const productId of productsToDeleteCache) {
+  if (productsToDeleteCache.size > 0) {
+    for (const productId of productsToDeleteCache) {
       try {
         await deleteCache(`product:${productId}`);
       } catch (error) {
@@ -97,13 +134,6 @@ export const createOrder = asyncHandler(async (req, res) => {
       console.error("Redis cache delete failed:", error.message);
     }
   }
-
-  const order = await Order.create({
-    user: req.user.id,
-    items: orderItems,
-    totalAmount,
-    status: "pending",
-  });
 
   return res
     .status(201)
@@ -141,22 +171,64 @@ export const getOrderById = asyncHandler(async (req, res) => {
 
 export const cancelOrder = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const session = await mongoose.startSession();
+  let order;
 
-  const order = await Order.findOne({
-    _id: id,
-    user: req.user.id,
-  });
+  try {
+    await session.withTransaction(async () => {
+      order = await Order.findOneAndUpdate(
+        {
+          _id: id,
+          user: req.user.id,
+          status: "pending",
+        },
+        {
+          $set: { status: "cancelled" },
+        },
+        {
+          returnDocument: "after",
+          session,
+        }
+      );
 
-  if (!order) {
-    throw new ApiError(404, "Order not found");
+      if (!order) {
+        throw new ApiError(404, "Order not found");
+      }
+
+      for (const item of order.items) {
+        const updatedProduct = await Product.findByIdAndUpdate(
+          item.product,
+          {
+            $inc: { stock: item.quantity },
+            $set: { inStock: true },
+          },
+          {
+            returnDocument: "after",
+            session,
+          }
+        );
+        if (!updatedProduct) {
+          throw new ApiError(404, "Product not found while cancelling order");
+        }
+      }
+    });
+  } finally {
+    await session.endSession();
   }
 
-  if (order.status !== "pending") {
-    throw new ApiError(400, "Only pending orders can be cancelled");
+  for (const item of order.items) {
+    try {
+      await deleteCache(`product:${item.product}`);
+    } catch (error) {
+      console.error("Redis cache delete failed:", error.message);
+    }
   }
 
-  order.status = "cancelled";
-  await order.save();
+  try {
+    await deleteCache(ALL_PRODUCTS_CACHE_KEY);
+  } catch (error) {
+    console.error("Redis cache delete failed:", error.message);
+  }
 
   return res
     .status(200)
